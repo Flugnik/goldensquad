@@ -1,0 +1,74 @@
+# docker-compose.yml - Версия 3.0. "Золотая команда" в полном составе.
+
+
+services:
+  # 1. Шеф-редактор Леон: Мозговой центр и дирижер.
+  chief-editor:
+    build:
+      context: .
+      dockerfile: editor.Dockerfile
+    container_name: gs_chief_editor
+    working_dir: /app
+    volumes:
+      - .:/app
+    environment:
+      - CLAUDE_API_KEY=${CLAUDE_API_KEY}
+      - CHIEF_EDITOR_MODEL=${CHIEF_EDITOR_MODEL:-claude-3-5-sonnet-20240620}
+    networks:
+      - golden-team-network
+
+  # 2. Копирайтер Ева: Голос и душа команды.
+  copywriter:
+    build:
+      context: .
+      dockerfile: copywriter.Dockerfile # Важно: создайте этот файл
+    container_name: gs_copywriter_eva
+    working_dir: /app
+    volumes:
+      - .:/app
+    environment:
+      - CLAUDE_API_KEY=${CLAUDE_API_KEY}
+      - COPYWRITER_MODEL=${COPYWRITER_MODEL:-claude-3-5-sonnet-20240620}
+    networks:
+      - golden-team-network
+    healthcheck:                # <--- НОВЫЙ блок
+      test: ["CMD", "curl", "-fs", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # 3. Дизайнер Адриан: Визуальный Маэстро.
+  designer:
+    build:
+      context: .
+      dockerfile: designer.Dockerfile # Важно: создайте этот файл
+    container_name: gs_designer_adrian
+    working_dir: /app
+    volumes:
+      - .:/app
+    environment:
+      - FAL_KEY=${FAL_KEY}
+    networks:
+      - golden-team-network
+  
+  # 4. Telegram-бот: Точка входа и интерфейс для пользователя.
+  telegram-bot:
+    build:
+      context: .
+      dockerfile: bot.Dockerfile
+    container_name: gs_telegram_bot
+    working_dir: /app
+    volumes:
+      - .:/app
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+    # Боту больше не нужны ключи от Claude и Fal, так как он общается с агентами.
+    networks:
+      - golden-team-network
+    # Команда запуска бота находится в bot.Dockerfile
+
+networks:
+  golden-team-network:
+    driver: bridge
+    name: golden-team-network
+

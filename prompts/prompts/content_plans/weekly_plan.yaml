@@ -1,0 +1,56 @@
+weekly_structure:
+  monday:
+    theme: "Диагностика и здоровье"
+    template: "health_diagnostic"
+    typical_topics:
+      - "Ранние признаки болезней"
+      - "Что 'говорят' животные"
+      - "Профилактика проблем"
+    
+  tuesday:
+    theme: "Кормление и рационы"
+    template: "practical_advice"
+    typical_topics:
+      - "Сезонные особенности кормления"
+      - "Экономия без ущерба качеству"
+      - "Народные методы улучшения аппетита"
+    
+  wednesday:
+    theme: "Разведение и воспроизводство"
+    template: "method_comparison"
+    typical_topics:
+      - "Искусственное осеменение vs естественное покрытие"
+      - "Подготовка к родам"
+      - "Выбор производителей"
+    
+  thursday:
+    theme: "Содержание и уход"
+    template: "seasonal_advice"
+    typical_topics:
+      - "Обустройство помещений"
+      - "Сезонные изменения в уходе"
+      - "Народная мудрость в содержании"
+    
+  friday:
+    theme: "Критический анализ"
+    template: "method_comparison"
+    typical_topics:
+      - "Промышленные методы для ЛПХ"
+      - "Разбор популярных советов"
+      - "Что работает, а что нет"
+    
+  saturday:
+    theme: "Экономика и планирование"
+    template: "business_advice"
+    typical_topics:
+      - "Снижение затрат без ущерба"
+      - "Планирование поголовья"
+      - "Народные способы экономии"
+    
+  sunday:
+    theme: "Философия и сообщество"
+    template: "community_discussion"
+    typical_topics:
+      - "Отношение к животным"
+      - "Житейская мудрость"
+      - "Обмен опытом между коллегами"

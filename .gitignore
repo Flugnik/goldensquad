@@ -1,0 +1,13 @@
+.env
+*.env
+results/
+logs/
+__pycache__/
+*.pyc
+postgres_data/
+minio_data/
+.vscode/
+.idea/
+notepad .gitignore
+# Node.js dependencies
+node_modules/
