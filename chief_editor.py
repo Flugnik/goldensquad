@@ -7,7 +7,6 @@ import asyncio
 import json
 import os
 import re
-import sys
 from typing import List, Optional
 
 import anthropic
@@ -22,18 +21,16 @@ class TopicsRequest(BaseModel):
     business_theme: str = Field(..., min_length=2, max_length=120)
     count: int = Field(5, ge=1, le=10)
 
-
 class TextDraftRequest(BaseModel):
     topic: str = Field(..., min_length=2, max_length=120)
     business_theme: Optional[str] = ""
-
 
 # --------------------------------------------------------------------------- #
 #                              Логика Шефа Леона                              #
 # --------------------------------------------------------------------------- #
 class ChiefEditor:
     def __init__(self) -> None:
-        self.model_name = os.getenv("CHIEF_EDITOR_MODEL", "claude-4-sonnet-20250501")
+        self.model_name = os.getenv("CHIEF_EDITOR_MODEL", "claude-sonnet-4-20250514")
         self.claude_api_key = os.getenv("CLAUDE_API_KEY")
 
         if not self.claude_api_key:
@@ -73,23 +70,18 @@ class ChiefEditor:
             return None
 
     async def _ask_claude(self, prompt: str, max_tokens: int = 1024) -> str:
-    """Единая точка общения с Anthropic API с безопасным логированием ошибок."""
-    try:
-        response = await self.client.messages.create(
-            model=self.model_name,
-            max_tokens=max_tokens,
-            system=self.constitution,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        # Берём первый completion и удаляем лишние пробелы
-        return response.content[0].text.strip()
-    except Exception:
-        # Печатаем полный стек-трэйс в stderr контейнера,
-        # чтобы он попал в docker logs.
-        traceback.print_exc(file=sys.stderr)
-        # Пробрасываем исключение дальше — FastAPI превратит его в 500.
-        raise
-
+        """Единая точка общения с Anthropic API + безопасный вывод ошибок."""
+        try:
+            response = await self.client.messages.create(
+                model=self.model_name,
+                max_tokens=max_tokens,
+                system=self.constitution,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return response.content[0].text.strip()
+        except Exception:
+            traceback.print_exc(file=sys.stderr)  # печать стека в логи контейнера
+            raise                                   # пробросим исключение дальше
 
     # ---------- публичные методы ------------------------------------------- #
     async def generate_topics(self, business_theme: str, count: int) -> List[str]:
@@ -113,18 +105,15 @@ class ChiefEditor:
         )
         return await self._ask_claude(prompt, max_tokens=256)
 
-
 # --------------------------------------------------------------------------- #
 #                           Конфигурация FastAPI-сервера                      #
 # --------------------------------------------------------------------------- #
 app = FastAPI(title="Golden Squad — Chief Editor API", version="4.1")
 editor = ChiefEditor()
 
-
 @app.get("/health", tags=["system"])
 async def health():
     return {"status": "ok"}
-
 
 @app.post("/generate_topics", tags=["workflow"])
 async def api_generate_topics(req: TopicsRequest):
@@ -134,7 +123,6 @@ async def api_generate_topics(req: TopicsRequest):
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
-
 @app.post("/create_task", tags=["workflow"])
 async def api_create_task(req: TextDraftRequest):
     try:
@@ -142,7 +130,6 @@ async def api_create_task(req: TextDraftRequest):
         return {"task_for_copywriter": task}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
-
 
 # --------------------------------------------------------------------------- #
 #                               Точка входа                                   #
