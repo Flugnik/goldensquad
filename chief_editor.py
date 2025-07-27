@@ -1,6 +1,8 @@
 # chief_editor.py — Версия 4.1. Шеф Леон с API на FastAPI.
 # Независимый микросервис, готовый к коммуникации с командой.
 
+import traceback
+import sys
 import asyncio
 import json
 import os
@@ -71,14 +73,23 @@ class ChiefEditor:
             return None
 
     async def _ask_claude(self, prompt: str, max_tokens: int = 1024) -> str:
-        """Единая точка общения с Anthropic API."""
+    """Единая точка общения с Anthropic API с безопасным логированием ошибок."""
+    try:
         response = await self.client.messages.create(
             model=self.model_name,
             max_tokens=max_tokens,
             system=self.constitution,
             messages=[{"role": "user", "content": prompt}],
         )
+        # Берём первый completion и удаляем лишние пробелы
         return response.content[0].text.strip()
+    except Exception:
+        # Печатаем полный стек-трэйс в stderr контейнера,
+        # чтобы он попал в docker logs.
+        traceback.print_exc(file=sys.stderr)
+        # Пробрасываем исключение дальше — FastAPI превратит его в 500.
+        raise
+
 
     # ---------- публичные методы ------------------------------------------- #
     async def generate_topics(self, business_theme: str, count: int) -> List[str]:
