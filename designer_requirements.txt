@@ -2,3 +2,6 @@ fal-client
 requests
 fastapi
 uvicorn[standard]
+anthropic
+supabase>=2.17.0
+python-dotenv>=1.1.1

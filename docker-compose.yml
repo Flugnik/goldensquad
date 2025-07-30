@@ -71,4 +71,3 @@ networks:
   golden-team-network:
     driver: bridge
     name: golden-team-network
-
