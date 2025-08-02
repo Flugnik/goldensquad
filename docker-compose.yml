@@ -1,74 +1,122 @@
-# docker-compose.yml - Версия 3.0. "Золотая команда" в полном составе.
-
-
 services:
-  # 1. Шеф-редактор Леон: Мозговой центр и дирижер.
+  # 1. Шеф-редактор Леон
   chief-editor:
-    build:
-      context: .
-      dockerfile: editor.Dockerfile
-    container_name: gs_chief_editor
+    build: ./chief-editor
     working_dir: /app
     volumes:
-      - .:/app
+      - ./src:/app/src:ro
+      - ./data:/app/data
     environment:
-      - CLAUDE_API_KEY=${CLAUDE_API_KEY}
-      - CHIEF_EDITOR_MODEL=${CHIEF_EDITOR_MODEL:-claude-sonnet-4-20250514}
-    networks:
-      - golden-team-network
-
-  # 2. Копирайтер Ева: Голос и душа команды.
-  copywriter:
-    build:
-      context: .
-      dockerfile: copywriter.Dockerfile # Важно: создайте этот файл
-    container_name: gs_copywriter_eva
-    working_dir: /app
-    volumes:
-      - .:/app
-    environment:
-      - CLAUDE_API_KEY=${CLAUDE_API_KEY}
-      - COPYWRITER_MODEL=${COPYWRITER_MODEL:-claude-sonnet-4-20250514}
-    networks:
-      - golden-team-network
-    healthcheck:                # <--- НОВЫЙ блок
-      test: ["CMD", "curl", "-fs", "http://localhost:8001/health"]
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+      CHIEF_EDITOR_MODEL: google/gemini-2.5-flash
+      API_BASE_URL: https://openrouter.ai/api/v1
+      SUPABASE_URL: ${SUPABASE_URL}
+      SUPABASE_KEY: ${SUPABASE_KEY}
+    networks: [golden-team-network]
+    ports: ["8000:8000"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://127.0.0.1:8000/health || exit 1"]
       interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+    read_only: true
+    tmpfs: [/tmp]
+
+  # 2. Копирайтер Ева
+  copywriter:
+    build: ./copywriter
+    working_dir: /app
+    volumes:
+      - ./src:/app/src:ro
+      - ./data:/app/data
+    environment:
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+      COPYWRITER_MODEL: claude-sonnet-4-20250514
+      API_BASE_URL: https://openrouter.ai/api/v1
+      SUPABASE_URL: ${SUPABASE_URL}
+      SUPABASE_KEY: ${SUPABASE_KEY}
+    networks: [golden-team-network]
+    ports: ["8001:8001"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://127.0.0.1:8001/health || exit 1"]
+      interval: 10s
       timeout: 5s
       retries: 3
+      start_period: 30s
+    restart: unless-stopped
+    read_only: true
+    tmpfs: [/tmp]
 
-  # 3. Дизайнер Адриан: Визуальный Маэстро.
+ # 3. Дизайнер Адриан
   designer:
-    build:
-      context: .
-      dockerfile: designer.Dockerfile # Важно: создайте этот файл
-    container_name: gs_designer_adrian
+    build: ./designer
     working_dir: /app
     volumes:
-      - .:/app
+      - ./src:/app/src:ro
+      - ./data:/app/data
+      - ./images:/app/images:rw      # ← добавлен :rw для записи изображений
+      - ./results:/app/results:rw    # ← добавлен :rw для записи результатов
     environment:
-      - FAL_KEY=${FAL_KEY}
-    networks:
-      - golden-team-network
-  
-  # 4. Telegram-бот: Точка входа и интерфейс для пользователя.
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+      DESIGNER_MODEL: google/gemini-2.5-flash
+      API_BASE_URL: https://openrouter.ai/api/v1
+      FAL_API_KEY: ${FAL_API_KEY}
+      FAL_MODEL: fal-ai/flux-pro
+      MAX_TOKENS: 1000
+      SUPABASE_URL: ${SUPABASE_URL}
+      SUPABASE_KEY: ${SUPABASE_KEY}
+    networks: [golden-team-network]
+    ports: ["8002:8002"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://127.0.0.1:8002/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+    read_only: false              # ← уже исправлено на false
+    tmpfs: [/tmp]
+
+  # 4. Telegram-бот
   telegram-bot:
-    build:
-      context: .
-      dockerfile: bot.Dockerfile
-    container_name: gs_telegram_bot
+    build: ./telegram-bot          # Dockerfile лежит в этом каталоге
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+    ports:
+      - "8003:8000"                # FastAPI внутри слушает 8000
+    networks: [golden-team-network]
+    restart: unless-stopped
+    read_only: true
+    tmpfs: [/tmp]
+    
+  # 5. Chat Coordinator - Единый чат с @-упоминаниями (ЗК 2.0)
+  chat-coordinator:
+    build: ./chat-coordinator
     working_dir: /app
     volumes:
-      - .:/app
+      - ./client_profiles:/app/client_profiles:ro
+      - ./data:/app/data
     environment:
-      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
-    # Боту больше не нужны ключи от Claude и Fal, так как он общается с агентами.
-    networks:
-      - golden-team-network
-    # Команда запуска бота находится в bot.Dockerfile
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+      SUPABASE_URL: ${SUPABASE_URL}
+      SUPABASE_KEY: ${SUPABASE_KEY}
+    networks: [golden-team-network]
+    ports: ["8004:8004"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://127.0.0.1:8004/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+    depends_on:
+      - chief-editor
+      - copywriter
+      - designer
 
 networks:
   golden-team-network:
     driver: bridge
-    name: golden-team-network
-

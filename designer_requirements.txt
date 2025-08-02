@@ -1,4 +1,0 @@
-fal-client
-requests
-fastapi
-uvicorn[standard]
