@@ -1,12 +1,32 @@
-# designer.py - Версия 2.1. Исправленный с OpenRouter API и улучшенной архитектурой
-
-import asyncio
 import os
-import sys
+from dotenv import load_dotenv
+from pathlib import Path
+import httpx
+import cachetools
+from yarl import URL
+import ipaddress
+import hashlib
+import imghdr
+
+# --- Определяем DEBUG_MODE ДО всего остального ---
+DEBUG_MODE = os.getenv("DEBUG", "true").lower() == "true"
+
+# --- Загружаем .env из корня проекта ---
+project_root = Path(__file__).parent.parent
+env_path = project_root / ".env"
+load_dotenv(dotenv_path=env_path)
+
+print(f"✅ Загружено .env из: {env_path}")
+print(f"🔍 FAL_API_KEY: {'YES' if os.getenv('FAL_API_KEY') else 'NO'}")
+print(f"🔍 OPENROUTER_API_KEY: {'YES' if os.getenv('OPENROUTER_API_KEY') else 'NO'}")
+print(f"🔧 DEBUG_MODE: {DEBUG_MODE}")
+
+# --- Оригинальный код ---
+import asyncio
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Any
 import aiohttp
 import aiofiles
 from fastapi import FastAPI, HTTPException
@@ -18,14 +38,21 @@ import uvicorn
 import openai
 import fal_client
 
-# Настройка логирования
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# --- Настройка логирования ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
-# Rate limiting
+# --- Rate Limiting ---
 limiter = Limiter(key_func=get_remote_address)
 
-# --- Модели данных для API (Pydantic) ---
+# --- Константы ---
+MAX_IMAGE_SIZE = 10 * 1024 * 1024  # 10 MB
+ALLOWED_HOSTS = ["fal.media", "cdn.fal.ai", "i.imgur.com", "example-assets.com"]
+
+# --- Модели данных ---
 class CreateImageRequest(BaseModel):
     task_from_chief: str = Field(min_length=10, description="Task from chief editor")
     post_text: str = Field(min_length=5, description="Text from copywriter")
@@ -35,189 +62,319 @@ class SaveImageRequest(BaseModel):
     image_url: str = Field(description="URL of approved image")
     topic: str = Field(description="Topic for file naming")
 
-# --- Основной класс агента ---
-class Designer:
-    def __init__(self):
-        self.fal_model = os.getenv('FAL_MODEL', 'fal-ai/flux-pro')
-        self.openrouter_model = os.getenv('DESIGNER_MODEL', 'google/gemini-2.5-flash')
-        self.max_tokens = int(os.getenv('MAX_TOKENS', '1000'))
-        
-        # Инициализация API клиентов
-        self.fal_api_key = self.read_secret('fal_api_key')
-        self.openrouter_key = self.read_secret('openrouter_api_key')
-        
-        # Настройка FAL клиента
-        os.environ['FAL_KEY'] = self.fal_api_key
-        
-        # Настройка OpenRouter клиента
-        self.openrouter_client = openai.AsyncOpenAI(
-            api_key=self.openrouter_key,
-            base_url=os.getenv('API_BASE_URL', 'https://openrouter.ai/api/v1')
-        )
-        
-        self.personality = self.load_personality()
-        self.ensure_directories()
-        logger.info(f"✅ Дизайнер v2.0 (Адриан, 'Маэстро Визуала') инициализирован. Инструмент: {self.fal_model}")
 
-    def read_secret(self, secret_name: str) -> str:
-        """Читает секрет из Docker Secrets или переменных окружения"""
-        try:
-            with open(f'/run/secrets/{secret_name}', 'r') as f:
+# --- Безопасный менеджер секретов ---
+class SecretManager:
+    def __init__(self, allow_env_fallback: bool = DEBUG_MODE):
+        self.allow_env_fallback = allow_env_fallback
+
+    def get(self, secret_name: str) -> str:
+        secret_path = f"/run/secrets/{secret_name}"
+        if os.path.exists(secret_path):
+            with open(secret_path, 'r') as f:
                 return f.read().strip()
-        except FileNotFoundError:
-            # Fallback для локальной разработки
+
+        if self.allow_env_fallback:
             env_map = {
                 'fal_api_key': 'FAL_API_KEY',
                 'openrouter_api_key': 'OPENROUTER_API_KEY'
             }
             env_var = env_map.get(secret_name, secret_name.upper())
-            api_key = os.getenv(env_var)
-            if not api_key:
-                raise ValueError(f"Neither secret file nor env var found for {secret_name}")
-            return api_key
+            value = os.getenv(env_var)
+            if value:
+                logger.warning(f"Using env var {env_var} for {secret_name} (DEV MODE)")
+                return value
 
-    def load_personality(self):
-        """Загружает личность дизайнера"""
+        raise RuntimeError(f"Secret {secret_name} not found in /run/secrets or env")
+
+# --- Валидатор URL (защита от SSRF) ---
+def is_safe_url(url_str: str) -> bool:
+    try:
+        url = URL(url_str)
+        if url.scheme not in ('http', 'https'):
+            return False
+        host = url.host.lower()
+        if not host:
+            return False
+
+        # Проверка на loopback и private IP
+        try:
+            ip = ipaddress.ip_address(host)
+            if ip.is_loopback or ip.is_private:
+                return False
+        except ValueError:
+            pass  # Это домен
+
+        # Проверка разрешенных доменов
+        return any(host.endswith(allowed) for allowed in ALLOWED_HOSTS)
+    except Exception:
+        return False
+
+
+# --- Prompt Generator Service ---
+class PromptGenerator:
+    def __init__(self, client: httpx.AsyncClient, model: str, max_tokens: int):
+        self.client = client
+        self.model = model
+        self.max_tokens = max_tokens
+        self.personality = self._load_personality()
+        self.cache = cachetools.TTLCache(maxsize=100, ttl=300)  # 5 минут
+
+    def _load_personality(self) -> Dict[str, str]:
         return {
             "name": "Adrian, Visual Maestro",
-            "constitution": """You are Adrian, the Visual Maestro. Your mission is to translate strategy and text into powerful visual language. You create not just images, but visual stories that amplify emotional impact.
-
-Your principles:
-1. Visual Storytelling - You don't illustrate, you tell stories
-2. Aesthetic Intelligence - You have innate sense of style  
-3. Depth and Metaphor - You seek metaphorical, not literal images
-4. Technical Mastery - You master cutting-edge generation tools"""
+            "constitution": (
+                "You are Adrian, the Visual Maestro. Your mission is to translate strategy and text "
+                "into powerful visual language. You create not just images, but visual stories that "
+                "amplify emotional impact. Principles: Visual Storytelling, Aesthetic Intelligence, "
+                "Depth and Metaphor, Technical Mastery."
+            )
         }
 
-    def ensure_directories(self):
-        """Создает необходимые директории"""
-        Path("results/ready_for_publish").mkdir(parents=True, exist_ok=True)
-        Path("images").mkdir(exist_ok=True)
+    def _get_cache_key(self, task: str, text: str) -> str:
+        content = f"{task[:100]}::{text[:200]}"
+        return hashlib.md5(content.encode()).hexdigest()
 
-    async def generate_english_prompt(self, task_from_chief: str, post_text: str) -> str:
-        """Генерирует английский промпт для изображения через OpenRouter"""
-        system_prompt = f"""You are Adrian, a professional visual designer. Create a detailed English prompt for image generation based on the given task and text.
+    async def generate(self, task: str, text: str) -> str:
+        cache_key = self._get_cache_key(task, text)
+        if cache_key in self.cache:
+            return self.cache[cache_key]
 
-{self.personality['constitution']}
+        system_prompt = f"""{self.personality['constitution']}
+Create a concise, visual-focused English prompt (max 150 words) that captures the essence and emotion.
+Avoid text in the image. Use photorealistic style."""
 
-Generate a concise, visual-focused English prompt (max 200 words) that captures the essence and emotion of the content."""
-
-        user_prompt = f"""TASK FROM CHIEF: {task_from_chief}
-COPYWRITER TEXT: {post_text}
-
-Create an English image generation prompt that:
-1. Captures the core metaphor and emotion
-2. Describes visual elements, style, lighting
-3. Avoids text/letters in the image
-4. Uses photorealistic style"""
+        user_prompt = f"""TASK: {task}
+TEXT: {text}
+Create an image generation prompt describing visual elements, style, lighting, metaphor."""
 
         try:
-            response = await self.openrouter_client.chat.completions.create(
-                model=self.openrouter_model,
-                max_tokens=self.max_tokens,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                temperature=0.7
+            response = await self.client.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                json={
+                    "model": self.model,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    "max_tokens": self.max_tokens,
+                    "temperature": 0.7
+                }
             )
-            
-            english_prompt = response.choices[0].message.content.strip()
-            logger.info(f"Generated English prompt: {english_prompt[:100]}...")
-            return english_prompt
-            
+            response.raise_for_status()
+            data = response.json()
+            prompt = data["choices"][0]["message"]["content"].strip()
+            logger.info(f"Generated prompt: {prompt[:80]}...")
+            self.cache[cache_key] = prompt
+            return prompt
         except Exception as e:
-            logger.error(f"Error generating English prompt: {e}")
-            # Fallback промпт
-            return f"Professional image based on: {post_text[:100]}, photorealistic style, high quality"
+            logger.error(f"OpenRouter API error: {e}")
+            return f"Photorealistic image based on: {text[:100]}"
 
-    async def create_image(self, task_from_chief: str, post_text: str) -> dict:
-        """Создает изображение на основе задания от Шефа и текста Копирайтера"""
-        logger.info(f"Creating image for task: {task_from_chief[:50]}...")
-        
+
+# --- Асинхронный FAL Image Generator ---
+class FALImageGenerator:
+    def __init__(self, api_key: str, model: str = "fal-ai/flux-pro"):
+        self.api_key = api_key
+        self.model = model
+        self.endpoint = f"https://api.fal.ai/v1/run/{model}"
+
+    async def generate(self, prompt: str) -> str:
+        headers = {
+            "Authorization": f"Key {self.api_key}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "prompt": prompt,
+            "image_size": os.getenv("IMAGE_SIZE", "landscape_4_3"),
+            "num_inference_steps": int(os.getenv("FAL_STEPS", "28")),
+            "guidance_scale": float(os.getenv("FAL_GUIDANCE", "3.5")),
+            "num_images": 1,
+            "enable_safety_checker": True
+        }
+
+        timeout = httpx.Timeout(connect=10, read=60, write=30, pool=15)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            try:
+                response = await client.post(self.endpoint, json=payload, headers=headers)
+                response.raise_for_status()
+                result = response.json()
+                if not result.get("images"):
+                    raise ValueError("No images returned from FAL")
+                image_url = result["images"][0]["url"]
+                logger.info(f"FAL generated image: {image_url}")
+                return image_url
+            except httpx.HTTPStatusError as e:
+                logger.error(f"FAL API HTTP error {e.response.status_code}: {e.response.text}")
+                raise HTTPException(status_code=502, detail="Image generation failed (FAL)")
+            except Exception as e:
+                logger.error(f"FAL API error: {e}")
+                raise HTTPException(status_code=500, detail="Image generation failed")
+
+
+# --- Image Saver Service ---
+class ImageSaver:
+    def __init__(self, save_dir: Path = Path("results/ready_for_publish")):
+        self.save_dir = save_dir
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+
+    def _sanitize_filename(self, topic: str) -> str:
+        clean = "".join(c for c in topic if c.isalnum() or c in " -_").strip()
+        return clean.replace(" ", "_")
+
+    def _validate_path(self, filename: str) -> Path:
+        full_path = (self.save_dir / filename).resolve()
         try:
-            # Генерируем английский промпт через OpenRouter
-            english_prompt = await self.generate_english_prompt(task_from_chief, post_text)
-            
-            # Генерируем изображение через FAL
-            logger.info(f"Sending to FAL model: {self.fal_model}")
-            
-            loop = asyncio.get_running_loop()
-            result = await loop.run_in_executor(
-                None,
-                lambda: fal_client.run(
-                    self.fal_model,
-                    arguments={
-                        "prompt": english_prompt,
-                        "image_size": "landscape_4_3",
-                        "num_inference_steps": 28,
-                        "guidance_scale": 3.5,
-                        "num_images": 1,
-                        "enable_safety_checker": True
-                    }
-                )
-            )
-            
-            if not result.get('images'):
-                raise ValueError("No images generated by FAL API")
-                
-            image_url = result['images'][0]['url']
-            logger.info(f"Image generated successfully: {image_url}")
-            
+            full_path.relative_to(self.save_dir.resolve())
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid file path")
+        return full_path
+
+    async def save_from_url(self, image_url: str, topic: str) -> Dict[str, str]:
+        if not is_safe_url(image_url):
+            raise HTTPException(status_code=400, detail="Disallowed image URL (SSRF protection)")
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_topic = self._sanitize_filename(topic)
+        filename = f"image_{safe_topic}_{timestamp}.png"
+        file_path = self._validate_path(filename)
+
+        timeout = httpx.Timeout(connect=10, read=30)
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            try:
+                response = await client.get(image_url, stream=True)
+                response.raise_for_status()
+
+                content_length = response.headers.get("Content-Length")
+                if content_length and int(content_length) > MAX_IMAGE_SIZE:
+                    raise HTTPException(status_code=413, detail="Image too large")
+
+                total_size = 0
+                async with aiofiles.open(file_path, "wb") as f:
+                    async for chunk in response.aiter_bytes(8192):
+                        total_size += len(chunk)
+                        if total_size > MAX_IMAGE_SIZE:
+                            await f.close()
+                            file_path.unlink(missing_ok=True)
+                            raise HTTPException(status_code=413, detail="Image too large")
+                        await f.write(chunk)
+
+                # Проверка формата
+                if imghdr.what(file_path) not in ("png", "jpeg", "jpg", "webp"):
+                    file_path.unlink()
+                    raise HTTPException(status_code=400, detail="Invalid image format")
+
+                logger.info(f"Image saved: {file_path}")
+                return {"image_path": str(file_path), "status": "saved"}
+
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.error(f"Download failed: {e}")
+                raise HTTPException(status_code=500, detail="Failed to download image")
+
+
+# --- Основной сервис Designer ---
+class DesignerService:
+    def __init__(self):
+        self.secret_manager = SecretManager()
+        self.fal_api_key = self.secret_manager.get("fal_api_key")
+        self.openrouter_api_key = self.secret_manager.get("openrouter_api_key")
+
+        # Конфигурация
+        self.fal_model = os.getenv("FAL_MODEL", "fal-ai/flux-pro")
+        self.openrouter_model = os.getenv("DESIGNER_MODEL", "google/gemini-2.5-flash")
+        self.max_tokens = int(os.getenv("MAX_TOKENS", "1000"))
+
+        # Сервисы
+        self.prompt_generator = PromptGenerator(
+            client=httpx.AsyncClient(
+                headers={"Authorization": f"Bearer {self.openrouter_api_key}"},
+                timeout=httpx.Timeout(30.0)
+            ),
+            model=self.openrouter_model,
+            max_tokens=self.max_tokens
+        )
+
+        self.image_generator = FALImageGenerator(
+            api_key=self.fal_api_key,
+            model=self.fal_model
+        )
+
+        self.image_saver = ImageSaver()
+
+        logger.info(f"✅ Designer Service initialized. Model: {self.fal_model}")
+
+    async def create_image(self, task: str, text: str) -> Dict[str, Any]:
+        try:
+            prompt = await self.prompt_generator.generate(task, text)
+            image_url = await self.image_generator.generate(prompt)
             return {
                 "image_url": image_url,
-                "english_prompt": english_prompt,
-                "fal_model": self.fal_model
+                "english_prompt": prompt,
+                "model": self.fal_model
             }
-            
+        except HTTPException:
+            raise
         except Exception as e:
-            logger.error(f"Error creating image: {e}")
-            raise HTTPException(status_code=500, detail=f"Image generation failed: {str(e)}")
+            logger.error(f"Image creation failed: {e}")
+            raise HTTPException(status_code=500, detail="Image generation failed")
 
-    async def save_approved_image(self, image_url: str, topic: str) -> dict:
-        """Скачивает и сохраняет одобренное изображение"""
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        clean_topic = "".join(c for c in topic if c.isalnum() or c in (' ', '-', '_')).strip()
-        filename = f"results/ready_for_publish/image_{clean_topic.replace(' ', '_')}_{timestamp}.png"
-        
+    async def save_image(self, image_url: str, topic: str) -> Dict[str, str]:
+        return await self.image_saver.save_from_url(image_url, topic)
+
+    async def health_check(self) -> Dict[str, Any]:
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(image_url) as response:
-                    if response.status == 200:
-                        async with aiofiles.open(filename, 'wb') as f:
-                            async for chunk in response.content.iter_chunked(8192):
-                                await f.write(chunk)
-                        
-                        logger.info(f"Image saved: {filename}")
-                        return {"image_path": filename, "status": "saved"}
-                    else:
-                        raise HTTPException(status_code=400, detail="Failed to download image")
-                        
-        except Exception as e:
-            logger.error(f"Error saving image: {e}")
-            raise HTTPException(status_code=500, detail=f"Failed to save image: {str(e)}")
+            # Проверка OpenRouter
+            test_response = await self.prompt_generator.client.get(
+                "https://openrouter.ai/api/v1/models",
+                timeout=5.0
+            )
+            test_response.raise_for_status()
 
-# --- Создание экземпляров FastAPI и агента ---
-app = FastAPI(title="Designer Adrian API", version="2.1")
+            # Проверка директории
+            import os # добавить импорт вверху файла
+
+            return {
+                "status": "ok",
+                "agent": "designer",
+                "name": "Adrian, Visual Maestro",
+                "fal_model": self.fal_model,
+                "openrouter_model": self.openrouter_model,
+                "storage": "ready"
+            }
+        except Exception as e:
+            logger.error(f"Health check failed: {e}")
+            return {
+                "status": "degraded",
+                "error": str(e),
+                "agent": "designer"
+            }
+
+
+# --- Инициализация приложения ---
+app = FastAPI(title="Designer Adrian API", version="3.0")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-designer = Designer()
+# Создание сервиса
+designer = DesignerService()
 
-# --- Health endpoint (ИСПРАВЛЕН!) ---
+
+# --- Health Endpoint ---
 @app.get("/health", tags=["system"])
 async def health():
     """Health check endpoint для мониторинга состояния сервиса"""
     try:
         # Проверяем подключение к OpenRouter
         await designer.openrouter_client.models.list()
-        
+
         # Проверяем директории
         Path("results/ready_for_publish").mkdir(parents=True, exist_ok=True)
-        
+
         return {
             "status": "ok",
-            "agent": "designer", 
+            "agent": "designer",
             "name": "Адриан Маэстро Визуала",
             "fal_model": designer.fal_model,
             "openrouter_model": designer.openrouter_model,
@@ -226,7 +383,7 @@ async def health():
     except Exception as e:
         logger.error(f"Health check failed: {e}")
         return {
-            "status": "degraded", 
+            "status": "degraded",
             "error": str(e),
             "agent": "designer"
         }
@@ -235,17 +392,18 @@ async def health():
 @app.post("/create_image", tags=["design"])
 @limiter.limit("3/minute")
 async def api_create_image(request: CreateImageRequest):
-    """Создает изображение на основе задания и текста"""
     result = await designer.create_image(request.task_from_chief, request.post_text)
     return result
 
+
 @app.post("/save_image", tags=["design"])
 async def api_save_image(request: SaveImageRequest):
-    """Сохраняет одобренное изображение"""
-    result = await designer.save_approved_image(request.image_url, request.topic)
+    result = await designer.save_image(request.image_url, request.topic)
     return result
 
-# --- Точка запуска сервера ---
+
+# --- Запуск ---
 if __name__ == "__main__":
-    logger.info("🚀 Запускаю сервер Дизайнера Адриана...")
+    logger.info("🚀 Starting Designer Adrian API v3.0...")
+    import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8002, log_level="info")

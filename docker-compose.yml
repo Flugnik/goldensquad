@@ -24,7 +24,7 @@ services:
     read_only: true
     tmpfs: [/tmp]
 
-  # 2. Копирайтер Ева
+  # 2. Копирайтер Алина
   copywriter:
     build: ./copywriter
     working_dir: /app

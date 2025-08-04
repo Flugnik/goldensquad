@@ -11,3 +11,14 @@ minio_data/
 notepad .gitignore
 # Node.js dependencies
 node_modules/
+# Секреты
+.env
+*.env
+
+# Виртуальное окружение
+venv/
+__pycache__
+*.pyc
+
+# Логи
+*.log
